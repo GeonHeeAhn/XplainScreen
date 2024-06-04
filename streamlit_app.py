@@ -9,12 +9,20 @@ from create_explanations import from_smiles
 from data_from_smile import process_out
 import math
 import base64 
+import torch as torch
+import pandas as pd
+import numpy as np
+import uuid
+import os
+from PIL import Image
 
 from rdkit import Chem, rdBase
 from rdkit.Chem import rdDepictor
 from rdkit.Chem import Draw
 from rdkit.Chem import AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
+from io import BytesIO
+
 
 import streamlit as st
 import pickle
@@ -23,8 +31,7 @@ from torch_geometric.utils.loop import add_remaining_self_loops
 from molecular_graph import Molecule
 from dig.xgraph.evaluation import XCollector, ExplanationProcessor
 
-from create_gpt import explain_molecule
-
+from create_gpt import explain_molecule, find_similar_smiles
 
 def load(data):
     if data == "tox":
@@ -42,7 +49,7 @@ clintox_explanations = load(data="clintox")
 def create_relevance_from_data(data, method="deeplift"):
     
     relevances_scale = []
-    all_edges = add_remaining_self_loops(data.edge_index)[0]
+    all_edges = add_remaining_self_loops(data.x)[0]
     if method == "deeplift":    
         try:
             exs = tox_21_explanations[data.smiles[0]]['deep_lift_edge_level_explanations']
@@ -126,30 +133,49 @@ def create_relevance_from_explanation(data, exs, method="deeplift"):
             return []
     return relevances_scale
 
+def create_relevance_for_smiles(data, exs, method="deeplift"):
+    
+    relevances_scale = []
+    all_edges = add_remaining_self_loops(data)[0]
+    if method == "deeplift":    
+        try:
+            for id in range(all_edges.size()[1]):
+                relevances_scale.append(([all_edges[0][id].item(),all_edges[1][id].item()], exs[1][id].item()-exs[0][id].item()) )
+        except Exception as e:
+            return []
+    return relevances_scale
 
 neg_color = (0.0, 1.0, 0.0)
 pos_color = (1.0, 0.0, 0.0)
 
+
 def encode_image(image_path):
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode('utf-8')
+    
+def encode_image2(image_path):
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        return f"data:image/png;base64,{encoded_string}"
 
-def plot_rdkit(smi, relevances_scale, data, label='', fmt='svg'): #svg
+def plot_rdkit(smi, relevances_scale, data, label='', fmt='svg', filename='rdkit_temp_image'): #svg
     rdDepictor.SetPreferCoordGen(True)
     mol = Chem.MolFromSmiles(smi)
     mol = Draw.PrepareMolForDrawing(mol)
-
-    alist = []
+    
     q = Chem.MolFromSmarts(smi)
     alist = [i for i in range(mol.GetNumAtoms())]
     
     atomList = [i for i in range(mol.GetNumAtoms())]
-    all_edges = add_remaining_self_loops(data.edge_index)[0]
+    if isinstance(data, torch.Tensor):
+        print("map: ", data)
+        all_edges = add_remaining_self_loops(data)[0]
+    else : 
+        print("map: ", data.edge_index)
+        all_edges = add_remaining_self_loops(data.edge_index)[0]
     edge_rel_map = {}
     for id in range(all_edges.size()[1]):
             edge_rel_map[(all_edges[0][id].item(),all_edges[1][id].item())]= relevances_scale[id]
-
-    print("alist : ",alist)
     bcols = {}
     for ha1 in alist:
         for ha2 in alist:
@@ -199,8 +225,8 @@ def plot_rdkit(smi, relevances_scale, data, label='', fmt='svg'): #svg
     d.drawOptions().fillHighlights = True
     d.DrawMoleculeWithHighlights(mol, label, acols, bcols, h_rads, h_lw_mult, -1)
     d.FinishDrawing()
-    with open("rdkit_temp_image.svg", mode) as f: 
-        f.write(d.GetDrawingText())
+    with open(f"{filename}.svg", mode) as f: 
+        f.write(d.GetDrawingText())        
         
     pngDraw = rdMolDraw2D.MolDraw2DCairo(400, 400)
     mode = 'wb'
@@ -208,18 +234,44 @@ def plot_rdkit(smi, relevances_scale, data, label='', fmt='svg'): #svg
     pngDraw.DrawMoleculeWithHighlights(mol, label, acols, bcols, h_rads, h_lw_mult, -1)
     pngDraw.FinishDrawing()
     
-    with open("rdkit_temp_image.png", mode) as f: 
+    with open(f"{filename}.png", mode) as f: 
         f.write(pngDraw.GetDrawingText())
     return atomList
 
+def add_data(f, fi, s, index):
+    if 'data' not in st.session_state:
+        st.session_state.data = []
+        
+    new_entry = {
+        'fidelity': f,
+        'fidelity_inv': fi,
+        'sparsity': s,
+        'smiles': index
+    }
+    st.session_state.data.append(new_entry)
+
+def split_text(text, length):
+    return '\n'.join([text[i:i+length] for i in range(0, len(text), length)])
+
+
+def display_images(img_urls, smiles, images_per_row=3):
+    for i in range(0, len(img_urls), images_per_row):
+        cols = st.columns(images_per_row)
+        for j, img_url in enumerate(img_urls[i:i+images_per_row]):
+            with cols[j]:
+                st.image(img_url, caption=smiles[j])
+                
+                
 #text 적히는 부분
 def plot_streamlit(option,relevances_scale, actual = None, x_collector=None, data_source=None, model_type=None, draw_rdkit=True, data=None):
-    atom = {}
+    if 'imgurls' not in st.session_state:
+        st.session_state.imgurls = []
+        
     if Vis_Style=="Custom":
         draw_rdkit=False
     if draw_rdkit:
         atom = plot_rdkit(option,relevances_scale,data)
-        st.image("rdkit_temp_image.svg") #svg
+        st.image("rdkit_temp_image.svg")
     else:
         molecule = Molecule(option)
         sample, pos_2d, graph = molecule.load_molecule()        
@@ -235,10 +287,17 @@ def plot_streamlit(option,relevances_scale, actual = None, x_collector=None, dat
                         <h3 style="font-family:sans-serif; color:#2ECC71; font-size: 20px;">Positive Contribution</h3>
                     </div>""", unsafe_allow_html=True)
     st.divider()
+    r_fid = round(x_collector.fidelity,2)
+    r_fidInv = round(x_collector.fidelity_inv,2)
+    r_spars = round(x_collector.sparsity,2)
+    
+    add_data(r_fid, r_fidInv, r_spars, option)
+
     if x_collector:
-        st.write("Fidelity is :", round(x_collector.fidelity, 2))
-        st.write("Fidelity_inv is :", round(x_collector.fidelity_inv, 2))
-        st.write("Sparsity is :", round(x_collector.sparsity, 2))
+        st.write("Fidelity is :", r_fid)
+        st.write("Fidelity_inv is :", r_fidInv)
+        st.write("Sparsity is :", r_spars)
+        
     
     data = process_out(option)[0]
     model = load_model(data=data_source, model_type=model_type)
@@ -256,16 +315,53 @@ def plot_streamlit(option,relevances_scale, actual = None, x_collector=None, dat
         else:
             prediction = "FDA Rejected"
     print(data_source, prediction)
-    print("atom", atom)
     print(out[0][0].item(),out[0][1].item(), actual)
     
     st.write("Prediction is :", prediction)
     if actual:
         st.write("Truth is :", actual)
+    
+    df = pd.DataFrame(st.session_state.data)
+
+    if not df.empty:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        bar_width = 0.2
+        index = np.arange(len(df))
+        
+        fid_bar = ax.bar(index, df['fidelity'], bar_width, label='Fidelity', color='orange')
+        fid_inv_bar = ax.bar(index + bar_width, df['fidelity_inv'], bar_width, label='Fidelity Inverse', color='gold')
+        spars_bar = ax.bar(index + 2 * bar_width, df['sparsity'], bar_width, label='Sparsity', color='darkorange')
+        
+        for i, (fidelity, fidelity_inv, sparsity) in enumerate(zip(df['fidelity'], df['fidelity_inv'], df['sparsity'])):
+            ax.text(i, fidelity, f'{fidelity:.2f}', ha='center', va='top',fontsize=9, fontweight='bold', color='black')
+            ax.text(i + bar_width, fidelity_inv, f'{fidelity_inv:.2f}', ha='center', va='top',fontsize=9, fontweight='bold', color='black')
+            ax.text(i + 2 * bar_width, sparsity, f'{sparsity:.2f}', ha='center', va='top',fontsize=9, fontweight='bold', color='black')
+
+        #ax.set_xlabel('Tries')
+        ax.set_ylabel('Value')
+        ax.set_title('Comparison Studies')
+        if len(df) > 4 :
+            df['smiles'] = df['smiles'].apply(lambda x: split_text(x, 10))
+        ax.set_xticks(index + bar_width)
+        ax.set_xticklabels(df['smiles'], fontsize=8)
+        ax.legend()
+
+
+        st.pyplot(fig)
+     
+    st.subheader("SMILES Log")   
+    imgURL = encode_image("rdkit_temp_image.png") 
+    imgURL2 = encode_image2("rdkit_temp_image.png")
+    st.session_state.imgurls.append(imgURL2)
+    display_images(st.session_state.imgurls, df['smiles'])
+    
+        
     st.divider()
-    with st.spinner("Analyzing smiles..."):
-        imgURL = encode_image("rdkit_temp_image.png") #svg
+     
+    with st.spinner("Analyzing smiles..."): 
         response = explain_molecule(method, option, prediction, imgURL)
+        
+    
     st.write(response)
 
     st.markdown("""<div style="font-weight: bold">Disclaimer</div>""", unsafe_allow_html=True)
@@ -273,11 +369,8 @@ def plot_streamlit(option,relevances_scale, actual = None, x_collector=None, dat
 
 
 
-
-
 st.markdown("""<div style="display:flex; flex-direction: column; justify-content:center; align-items: center;">
-                <div style="font-weight: bold; font-size: 30px;" >Explanation Framework for GNN based</div>
-                <div style="font-weight: bold; font-size: 30px;">Drug Screening Models</div>
+                <div style="font-weight: bold; font-size: 50px;" >🔑 XplainScreen</div>
             </div>""", unsafe_allow_html=True)
 
 st.sidebar.title("Options")
@@ -349,7 +442,7 @@ if st.sidebar.button("process tox"):
                 actual == None
             else:
                 if int(tox_21_explanations[option]['data'].y[0].item())==1:
-                    actual = "Toxic"
+                    actual = "Non Toxic"
             plot_streamlit(user_input, relevances_scale, actual=actual, x_collector = x_collector, data_source="tox",model_type=ModelType, data=data[0])
     else:
         st.markdown('<p style="font-family:sans-serif; color:red; font-size: 50px;">Invalid Smile String</p>', unsafe_allow_html=True)
